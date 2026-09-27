@@ -1,9 +1,8 @@
 // ESP32 central del túnel - Proyecto Integrador (estación DLMPS-800A)
-// Funcionamiento, pines y comandos de simulación: ver README.md
 
 #include <Arduino.h>
 
-// ===================== MODO =====================
+// MODO
 #define MODO_SIMULACION 1   // 1 = Wokwi, 0 = hardware real
 #define BUZZER_ACTIVO   0   // 1 = buzzer activo (digitalWrite), 0 = pasivo (tone)
 
@@ -15,7 +14,7 @@
   uint8_t MAC_BRAZO[] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x02};
 #endif
 
-// ===================== PINES =====================
+// PINES
 const uint8_t PIN_LED_VERDE    = 25;
 const uint8_t PIN_LED_AMARILLO = 26;
 const uint8_t PIN_LED_ROJO     = 27;
@@ -26,7 +25,7 @@ const uint8_t PIN_BUZZER       = 14;
 const uint8_t PIN_SENSOR       = 32;
 const uint8_t PIN_BOTON_ACK    = 33;
 
-// ===================== TIEMPOS (ms) =====================
+// TIEMPOS (ms)
 const uint32_t TIEMPO_DEBOUNCE_MS  = 50;
 #if MODO_SIMULACION
 const uint32_t TIMEOUT_QR_MS       = 20000;
@@ -36,7 +35,7 @@ const uint32_t TIMEOUT_QR_MS       = 5000;
 const uint32_t TIMEOUT_BRAZO_MS    = 10000;
 const uint32_t SIM_TIEMPO_BRAZO_MS = 4000;
 
-// ===================== MENSAJES =====================
+// MENSAJES
 // Estas estructuras deben ser IDÉNTICAS en la ESP32-CAM y en la ESP32 del brazo.
 
 enum TipoPieza : uint8_t {
@@ -61,7 +60,7 @@ typedef struct __attribute__((packed)) { uint8_t tipo; } MensajeQR;
 typedef struct __attribute__((packed)) { uint8_t comando; uint8_t tipo; uint16_t id; } MensajeOrden;
 typedef struct __attribute__((packed)) { uint8_t estado; uint16_t id; } MensajeRespuesta;
 
-// ===================== ESTADOS =====================
+// ESTADOS
 
 enum Estado : uint8_t {
   EST_LIBRE,
@@ -80,7 +79,7 @@ enum CausaError : uint8_t {
   ERR_BRAZO_FALLA    = 4
 };
 
-// ===================== VARIABLES =====================
+// VARIABLES
 
 Estado     estado      = EST_LIBRE;
 CausaError causa       = ERR_NINGUNO;
@@ -113,7 +112,7 @@ bool     simColgar  = false;
 uint32_t simTInicio = 0;
 #endif
 
-// ===================== UTILIDADES =====================
+// UTILIDADES
 
 const char *nombreEstado(Estado e) {
   switch (e) {
@@ -200,7 +199,7 @@ void actualizarBuzzer() {
   }
 }
 
-// ===================== COMUNICACIÓN CON EL BRAZO =====================
+// COMUNICACIÓN CON EL BRAZO
 
 void enviarOrdenBrazo(uint8_t comando, uint8_t tipo) {
   MensajeOrden m;
@@ -224,7 +223,7 @@ void enviarOrdenBrazo(uint8_t comando, uint8_t tipo) {
 #endif
 }
 
-// ===================== MÁQUINA DE ESTADOS =====================
+// MÁQUINA DE ESTADOS
 
 void cambiarEstado(Estado nuevo) {
   estado  = nuevo;
@@ -290,7 +289,6 @@ void actualizarEstado() {
           } else if (respEstado == BRAZO_ERROR) {
             irAError(ERR_BRAZO_FALLA);
           }
-          // BRAZO_OCUPADO: se sigue esperando
         }
       } else if (millis() - tEstado > TIMEOUT_BRAZO_MS) {
         irAError(ERR_BRAZO_TIMEOUT);
@@ -314,7 +312,7 @@ void actualizarEstado() {
   }
 }
 
-// ===================== SIMULACIÓN (Wokwi) =====================
+// SIMULACIÓN (Wokwi)
 #if MODO_SIMULACION
 
 void procesarComando(String cmd) {
@@ -363,7 +361,7 @@ void simularBrazo() {
 }
 
 #else
-// ===================== ESP-NOW (hardware real) =====================
+// ESP-NOW (hardware real)
 
 bool mismaMac(const uint8_t *a, const uint8_t *b) {
   return memcmp(a, b, 6) == 0;
@@ -413,7 +411,7 @@ void iniciarEspNow() {
 }
 #endif
 
-// ===================== SETUP / LOOP =====================
+// SETUP / LOOP
 
 void setup() {
   Serial.begin(115200);
@@ -431,13 +429,13 @@ void setup() {
   detenerCinta(false);
 
 #if MODO_SIMULACION
-  Serial.println("=== ESP32 CENTRAL (SIMULACION) ===");
+  Serial.println("ESP32 CENTRAL (SIMULACION)");
   Serial.println("1) Mantene apretado el pulsador SENSOR (contenedor presente)");
   Serial.println("2) Escribi TORNILLO, TUERCA o ARANDELA (simula el QR)");
   Serial.println("Extras: FALLA / COLGAR / cualquier otro texto = QR desconocido");
 #else
   iniciarEspNow();
-  Serial.println("=== ESP32 CENTRAL ===");
+  Serial.println("ESP32 CENTRAL");
 #endif
 
   cambiarEstado(EST_LIBRE);
