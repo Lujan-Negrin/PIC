@@ -1,17 +1,28 @@
 // ESP32 central del túnel - Proyecto Integrador (estación DLMPS-800A)
-// Version con manejo de errores (QR y brazo) y boton de reconocimiento
-// Funcionamiento completo: ver README.md
+// Funcionamiento, pines y comandos de simulación: ver README.md
 
 #include <Arduino.h>
 
 // ===================== MODO =====================
 #define MODO_SIMULACION 1   // 1 = Wokwi, 0 = hardware real
+#define BUZZER_ACTIVO   0   // 1 = buzzer activo (digitalWrite), 0 = pasivo (tone)
+
+#if !MODO_SIMULACION
+  #include <WiFi.h>
+  #include <esp_now.h>
+  // Reemplazar por las MAC reales
+  uint8_t MAC_CAM[]   = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01};
+  uint8_t MAC_BRAZO[] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x02};
+#endif
 
 // ===================== PINES =====================
 const uint8_t PIN_LED_VERDE    = 25;
 const uint8_t PIN_LED_AMARILLO = 26;
 const uint8_t PIN_LED_ROJO     = 27;
+// En Wokwi este LED azul representa la cinta: encendido = cinta DETENIDA.
+// En el equipo real, reemplazar por la salida hacia el relé/PLC de la cinta.
 const uint8_t PIN_CINTA_STOP   = 13;
+const uint8_t PIN_BUZZER       = 14;
 const uint8_t PIN_SENSOR       = 32;
 const uint8_t PIN_BOTON_ACK    = 33;
 
@@ -25,7 +36,8 @@ const uint32_t TIMEOUT_QR_MS       = 5000;
 const uint32_t TIMEOUT_BRAZO_MS    = 10000;
 const uint32_t SIM_TIEMPO_BRAZO_MS = 4000;
 
-// ===================== TIPOS =====================
+// ===================== MENSAJES =====================
+// Estas estructuras deben ser IDÉNTICAS en la ESP32-CAM y en la ESP32 del brazo.
 
 enum TipoPieza : uint8_t {
   PIEZA_DESCONOCIDA = 0,
@@ -33,6 +45,23 @@ enum TipoPieza : uint8_t {
   PIEZA_TUERCA      = 2,
   PIEZA_ARANDELA    = 3
 };
+
+enum Comando : uint8_t {
+  CMD_EJECUTAR = 1,
+  CMD_PAUSA    = 2
+};
+
+enum EstadoBrazo : uint8_t {
+  BRAZO_OK      = 1,
+  BRAZO_OCUPADO = 2,
+  BRAZO_ERROR   = 3
+};
+
+typedef struct __attribute__((packed)) { uint8_t tipo; } MensajeQR;
+typedef struct __attribute__((packed)) { uint8_t comando; uint8_t tipo; uint16_t id; } MensajeOrden;
+typedef struct __attribute__((packed)) { uint8_t estado; uint16_t id; } MensajeRespuesta;
+
+// ===================== ESTADOS =====================
 
 enum Estado : uint8_t {
   EST_LIBRE,
@@ -42,7 +71,7 @@ enum Estado : uint8_t {
   EST_ERROR
 };
 
-// El valor de cada causa queda reservado para identificarla mas adelante
+// El valor de cada causa es la cantidad de pitidos del buzzer
 enum CausaError : uint8_t {
   ERR_NINGUNO        = 0,
   ERR_QR_TIMEOUT     = 1,
@@ -53,13 +82,18 @@ enum CausaError : uint8_t {
 
 // ===================== VARIABLES =====================
 
-Estado     estado     = EST_LIBRE;
-CausaError causa      = ERR_NINGUNO;
-uint32_t   tEstado    = 0;
-uint8_t    tipoActual = PIEZA_DESCONOCIDA;
+Estado     estado      = EST_LIBRE;
+CausaError causa       = ERR_NINGUNO;
+uint32_t   tEstado     = 0;
+uint16_t   idSecuencia = 0;
+uint8_t    tipoActual  = PIEZA_DESCONOCIDA;
+bool       buzzerSonando = false;
 
-volatile bool    hayQR  = false;
-volatile uint8_t qrTipo = PIEZA_DESCONOCIDA;
+volatile bool     hayQR        = false;
+volatile uint8_t  qrTipo       = PIEZA_DESCONOCIDA;
+volatile bool     hayRespuesta = false;
+volatile uint8_t  respEstado   = 0;
+volatile uint16_t respId       = 0;
 
 struct Entrada {
   uint8_t  pin;
@@ -72,9 +106,11 @@ Entrada sensor   = {PIN_SENSOR,    false, false, 0, false};
 Entrada botonAck = {PIN_BOTON_ACK, false, false, 0, false};
 
 #if MODO_SIMULACION
-String   bufferSerial   = "";
+String   bufferSerial = "";
 bool     simBrazoActivo = false;
-uint32_t simTInicio     = 0;
+bool     simFalla   = false;
+bool     simColgar  = false;
+uint32_t simTInicio = 0;
 #endif
 
 // ===================== UTILIDADES =====================
@@ -133,6 +169,61 @@ void detenerCinta(bool detener) {
   digitalWrite(PIN_CINTA_STOP, detener ? HIGH : LOW);
 }
 
+void buzzerEncender() {
+#if BUZZER_ACTIVO
+  digitalWrite(PIN_BUZZER, HIGH);
+#else
+  tone(PIN_BUZZER, 2000);
+#endif
+}
+
+void buzzerApagar() {
+#if BUZZER_ACTIVO
+  digitalWrite(PIN_BUZZER, LOW);
+#else
+  noTone(PIN_BUZZER);
+#endif
+}
+
+void actualizarBuzzer() {
+  bool debeSonar = false;
+  if (estado == EST_ERROR && causa != ERR_NINGUNO) {
+    uint32_t pitidos  = (uint32_t)causa;
+    uint32_t duracion = pitidos * 300UL;
+    uint32_t ciclo    = duracion + 1200UL;
+    uint32_t t        = (millis() - tEstado) % ciclo;
+    debeSonar = (t < duracion) && ((t % 300UL) < 150UL);
+  }
+  if (debeSonar != buzzerSonando) {
+    buzzerSonando = debeSonar;
+    if (debeSonar) buzzerEncender(); else buzzerApagar();
+  }
+}
+
+// ===================== COMUNICACIÓN CON EL BRAZO =====================
+
+void enviarOrdenBrazo(uint8_t comando, uint8_t tipo) {
+  MensajeOrden m;
+  m.comando = comando;
+  m.tipo    = tipo;
+  m.id      = idSecuencia;
+
+#if MODO_SIMULACION
+  Serial.printf("[SIM] Orden al brazo: %s, pieza=%s, id=%u\n",
+                comando == CMD_EJECUTAR ? "EJECUTAR" : "PAUSA", nombreTipo(tipo), idSecuencia);
+  if (comando == CMD_EJECUTAR) {
+    simBrazoActivo = !simColgar;
+    simColgar = false;
+    simTInicio = millis();
+  } else {
+    simBrazoActivo = false;
+  }
+#else
+  esp_err_t r = esp_now_send(MAC_BRAZO, (uint8_t *)&m, sizeof(m));
+  if (r != ESP_OK) Serial.printf("Error enviando al brazo (codigo %d)\n", r);
+#endif
+}
+
 // ===================== MÁQUINA DE ESTADOS =====================
 
 void cambiarEstado(Estado nuevo) {
@@ -152,9 +243,9 @@ void irAError(CausaError c) {
   if (estado == EST_ERROR) return;
   causa = c;
   detenerCinta(true);
-  // TODO: avisarle al brazo que se pause (proximo commit, via ESP-NOW)
+  enviarOrdenBrazo(CMD_PAUSA, 0);
   cambiarEstado(EST_ERROR);
-  Serial.printf("[ERROR] %s. Apretar el boton de reconocimiento.\n", nombreCausa(c));
+  Serial.printf("[ERROR] %s (%u pitidos). Apretar el boton de reconocimiento.\n", nombreCausa(c), (uint8_t)c);
 }
 
 void actualizarEstado() {
@@ -178,11 +269,9 @@ void actualizarEstado() {
           irAError(ERR_QR_DESCONOCIDO);
         } else {
           tipoActual = tipo;
-#if MODO_SIMULACION
-          Serial.println("[SIM] El brazo se pone a trabajar...");
-          simBrazoActivo = true;
-          simTInicio = millis();
-#endif
+          idSecuencia++;
+          hayRespuesta = false;
+          enviarOrdenBrazo(CMD_EJECUTAR, tipoActual);
           cambiarEstado(EST_BRAZO_TRABAJANDO);
         }
       } else if (millis() - tEstado > TIMEOUT_QR_MS) {
@@ -191,18 +280,21 @@ void actualizarEstado() {
       break;
 
     case EST_BRAZO_TRABAJANDO:
-#if MODO_SIMULACION
-      if (simBrazoActivo && (millis() - simTInicio) > SIM_TIEMPO_BRAZO_MS) {
-        simBrazoActivo = false;
-        Serial.println("[SIM] El brazo termino la secuencia");
-        detenerCinta(false);
-        cambiarEstado(EST_LIBERAR_CONTENEDOR);
-      }
-#endif
-      if (millis() - tEstado > TIMEOUT_BRAZO_MS) {
+      if (hayRespuesta) {
+        hayRespuesta = false;
+        if (respId == idSecuencia) {
+          if (respEstado == BRAZO_OK) {
+            Serial.println("[BRAZO] Secuencia terminada");
+            detenerCinta(false);
+            cambiarEstado(EST_LIBERAR_CONTENEDOR);
+          } else if (respEstado == BRAZO_ERROR) {
+            irAError(ERR_BRAZO_FALLA);
+          }
+          // BRAZO_OCUPADO: se sigue esperando
+        }
+      } else if (millis() - tEstado > TIMEOUT_BRAZO_MS) {
         irAError(ERR_BRAZO_TIMEOUT);
       }
-      // TODO: reemplazar por la respuesta real del brazo (ESP-NOW)
       break;
 
     case EST_LIBERAR_CONTENEDOR:
@@ -225,17 +317,32 @@ void actualizarEstado() {
 // ===================== SIMULACIÓN (Wokwi) =====================
 #if MODO_SIMULACION
 
+void procesarComando(String cmd) {
+  cmd.trim();
+  cmd.toUpperCase();
+  if (cmd == "FALLA") {
+    simFalla = true;
+    Serial.println("[SIM] La proxima respuesta del brazo sera ERROR");
+  } else if (cmd == "COLGAR") {
+    simColgar = true;
+    Serial.println("[SIM] El brazo no respondera a la proxima orden");
+  } else {
+    Serial.printf("[SIM] Texto recibido: %s\n", cmd.c_str());
+    if (estado != EST_LEYENDO_QR) {
+      Serial.printf("[SIM] Ignorado: el estado actual es %s. Primero apreta SENSOR y espera el LED amarillo.\n", nombreEstado(estado));
+    } else {
+      qrTipo = tipoDesdeTexto(cmd);
+      hayQR  = true;
+    }
+  }
+}
+
 void procesarSerial() {
   while (Serial.available()) {
     char c = Serial.read();
     if (c == '\n' || c == '\r') {
       if (bufferSerial.length() > 0) {
-        bufferSerial.trim();
-        bufferSerial.toUpperCase();
-        if (estado == EST_LEYENDO_QR) {
-          qrTipo = tipoDesdeTexto(bufferSerial);
-          hayQR  = true;
-        }
+        procesarComando(bufferSerial);
         bufferSerial = "";
       }
     } else {
@@ -244,6 +351,66 @@ void procesarSerial() {
   }
 }
 
+void simularBrazo() {
+  if (simBrazoActivo && (millis() - simTInicio) > SIM_TIEMPO_BRAZO_MS) {
+    simBrazoActivo = false;
+    respEstado = simFalla ? BRAZO_ERROR : BRAZO_OK;
+    respId = idSecuencia;
+    hayRespuesta = true;
+    simFalla = false;
+    Serial.printf("[SIM] El brazo responde: %s\n", respEstado == BRAZO_OK ? "OK" : "ERROR");
+  }
+}
+
+#else
+// ===================== ESP-NOW (hardware real) =====================
+
+bool mismaMac(const uint8_t *a, const uint8_t *b) {
+  return memcmp(a, b, 6) == 0;
+}
+
+void procesarMensaje(const uint8_t *mac, const uint8_t *datos, int largo) {
+  if (mismaMac(mac, MAC_CAM) && largo == sizeof(MensajeQR)) {
+    MensajeQR m;
+    memcpy(&m, datos, sizeof(m));
+    qrTipo = m.tipo;
+    hayQR  = true;
+  } else if (mismaMac(mac, MAC_BRAZO) && largo == sizeof(MensajeRespuesta)) {
+    MensajeRespuesta m;
+    memcpy(&m, datos, sizeof(m));
+    respEstado   = m.estado;
+    respId       = m.id;
+    hayRespuesta = true;
+  }
+}
+
+// La firma del callback cambió entre versiones del core de ESP32 para Arduino
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+void alRecibir(const esp_now_recv_info_t *info, const uint8_t *datos, int largo) {
+  procesarMensaje(info->src_addr, datos, largo);
+}
+#else
+void alRecibir(const uint8_t *mac, const uint8_t *datos, int largo) {
+  procesarMensaje(mac, datos, largo);
+}
+#endif
+
+void iniciarEspNow() {
+  WiFi.mode(WIFI_STA);
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error iniciando ESP-NOW");
+    return;
+  }
+  esp_now_register_recv_cb(alRecibir);
+
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, MAC_BRAZO, 6);
+  peer.channel = 0;
+  peer.encrypt = false;
+  if (esp_now_add_peer(&peer) != ESP_OK) {
+    Serial.println("Error agregando el brazo como peer");
+  }
+}
 #endif
 
 // ===================== SETUP / LOOP =====================
@@ -256,12 +423,23 @@ void setup() {
   pinMode(PIN_LED_AMARILLO, OUTPUT);
   pinMode(PIN_LED_ROJO,     OUTPUT);
   pinMode(PIN_CINTA_STOP,   OUTPUT);
+  pinMode(PIN_BUZZER,       OUTPUT);
   pinMode(PIN_SENSOR,       INPUT_PULLUP);
   pinMode(PIN_BOTON_ACK,    INPUT_PULLUP);
 
+  buzzerApagar();
   detenerCinta(false);
 
-  Serial.println("=== ESP32 CENTRAL (con manejo de errores) ===");
+#if MODO_SIMULACION
+  Serial.println("=== ESP32 CENTRAL (SIMULACION) ===");
+  Serial.println("1) Mantene apretado el pulsador SENSOR (contenedor presente)");
+  Serial.println("2) Escribi TORNILLO, TUERCA o ARANDELA (simula el QR)");
+  Serial.println("Extras: FALLA / COLGAR / cualquier otro texto = QR desconocido");
+#else
+  iniciarEspNow();
+  Serial.println("=== ESP32 CENTRAL ===");
+#endif
+
   cambiarEstado(EST_LIBRE);
 }
 
@@ -271,7 +449,9 @@ void loop() {
 
 #if MODO_SIMULACION
   procesarSerial();
+  simularBrazo();
 #endif
 
   actualizarEstado();
+  actualizarBuzzer();
 }
