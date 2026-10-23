@@ -1,4 +1,7 @@
 from machine import Pin, PWM
+import network
+import espnow
+import time
 import math
 
 # PINES DE LOS SERVOS 
@@ -9,10 +12,20 @@ PIN_MUÑECA = 27
 
 PIN_LED_TRABAJANDO = 2     # LED que indica "el brazo esta en movimiento"
 
+# PROTOCOLO CON LA CENTRAL 
+MAC_CENTRAL = b'\xAA\xBB\xCC\xDD\xEE\x01'
+
 PIEZA_DESCONOCIDA = 0
 PIEZA_TORNILLO = 1
 PIEZA_TUERCA = 2
 PIEZA_ARANDELA = 3
+
+CMD_EJECUTAR = 1
+CMD_PAUSA = 2
+
+BRAZO_OK = 1
+BRAZO_OCUPADO = 2
+BRAZO_ERROR = 3
 
 NOMBRE_PIEZA = {
     PIEZA_TORNILLO: "TORNILLO",
@@ -97,7 +110,6 @@ def angulos_validos(angulos_crudos):
     return angulos
 
 
-# PUNTOS (x, y, z) POR PIEZA  
 POSICION_REPOSO = [90, 90, 90, 90]
 
 PUNTOS_PIEZA = {
@@ -105,3 +117,57 @@ PUNTOS_PIEZA = {
     PIEZA_TUERCA: [(6, 0, 10), (6, 0, 2), (0, -8, 10)],
     PIEZA_ARANDELA: [(5, -5, 10), (5, -5, 2), (0, -8, 10)],
 }
+
+TIEMPO_ENTRE_PASOS = 0.6
+led_trabajando = Pin(PIN_LED_TRABAJANDO, Pin.OUT)
+
+
+def mover_pieza(brazo, tipo):
+    puntos = PUNTOS_PIEZA.get(tipo)
+    if puntos is None:
+        print("[BRAZO] Tipo de pieza sin posiciones definidas:", tipo)
+        return BRAZO_ERROR
+
+    print("[BRAZO] Moviendo para:", NOMBRE_PIEZA.get(tipo, "?"))
+    led_trabajando.value(1)
+    for punto in puntos:
+        angulos_crudos = ci.calcular(punto)
+        angulos = angulos_validos(angulos_crudos)
+        brazo.set_angulos(angulos)
+        time.sleep(TIEMPO_ENTRE_PASOS)
+    brazo.set_angulos(POSICION_REPOSO)
+    led_trabajando.value(0)
+    print("[BRAZO] Movimiento terminado")
+    return BRAZO_OK
+
+
+# ESP-NOW 
+wifi = network.WLAN(network.STA_IF)
+wifi.active(True)
+enlace = espnow.ESPNow()
+enlace.active(True)
+enlace.add_peer(MAC_CENTRAL)
+
+
+def enviar_respuesta(estado, id_secuencia):
+    msg = bytes([estado, (id_secuencia >> 8) & 0xFF, id_secuencia & 0xFF])
+    try:
+        enlace.send(MAC_CENTRAL, msg)
+    except OSError as e:
+        print("Error enviando respuesta a la central:", e)
+
+
+def revisar_espnow(brazo):
+    host, msg = enlace.recv(0)
+    if msg is None or len(msg) != 4:
+        return
+    comando, tipo = msg[0], msg[1]
+    id_secuencia = (msg[2] << 8) | msg[3]
+
+    if comando == CMD_EJECUTAR:
+        print("[BRAZO] Orden recibida: EJECUTAR, id={}".format(id_secuencia))
+        estado = mover_pieza(brazo, tipo)
+        enviar_respuesta(estado, id_secuencia)
+    elif comando == CMD_PAUSA:
+        print("[BRAZO] Orden recibida: PAUSA, id={}".format(id_secuencia))
+        led_trabajando.value(0)
