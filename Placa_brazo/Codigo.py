@@ -2,6 +2,8 @@ from machine import Pin, PWM
 import network
 import espnow
 import time
+import sys
+import select
 import math
 
 # PINES DE LOS SERVOS 
@@ -32,6 +34,11 @@ NOMBRE_PIEZA = {
     PIEZA_TUERCA: "TUERCA",
     PIEZA_ARANDELA: "ARANDELA",
 }
+
+# Si es True, ademas de ESP-NOW tambien se puede seguir calibrando a mano
+# por USB con la app de escritorio (comandos "S1:90", "S2:45", etc).
+PERMITIR_CONTROL_MANUAL = True
+
 
 # SERVOS 
 class Servo:
@@ -110,6 +117,7 @@ def angulos_validos(angulos_crudos):
     return angulos
 
 
+# PUNTOS (x, y, z) POR PIEZA  
 POSICION_REPOSO = [90, 90, 90, 90]
 
 PUNTOS_PIEZA = {
@@ -171,3 +179,72 @@ def revisar_espnow(brazo):
     elif comando == CMD_PAUSA:
         print("[BRAZO] Orden recibida: PAUSA, id={}".format(id_secuencia))
         led_trabajando.value(0)
+
+
+# CONTROL MANUAL POR USB 
+class Serial:
+    def __init__(self):
+        self.spoll = select.poll()
+        self.spoll.register(sys.stdin, select.POLLIN)
+
+    def verificar(self):
+        return bool(self.spoll.poll(0))
+
+    def read(self):
+        lectura = ""
+        while self.spoll.poll(0):
+            c = sys.stdin.read(1)
+            if c == '\n':
+                return lectura
+            lectura += c
+        return "error"
+
+
+SERVO_POR_INDICE = None  
+
+
+def revisar_manual(serial):
+    if not serial.verificar():
+        return
+    lectura = serial.read()
+    if lectura.startswith("S") and ":" in lectura:
+        try:
+            indice_txt, angulo_txt = lectura[1:].split(":", 1)
+            indice = int(indice_txt)
+            angulo = int(angulo_txt)
+        except ValueError:
+            print("[MANUAL] Comando invalido:", lectura)
+            return
+        servo = SERVO_POR_INDICE.get(indice)
+        if servo:
+            servo.angulo(angulo)
+        else:
+            print("[MANUAL] Indice de servo desconocido:", indice)
+
+
+# SETUP / LOOP 
+print("ESP32 BRAZO")
+print("Mi MAC:", wifi.config('mac'))
+print("(copiar esta MAC en MAC_BRAZO del codigo de la central)")
+
+brazo = Brazo()
+brazo.set_angulos(POSICION_REPOSO)
+
+SERVO_POR_INDICE = {
+    1: brazo.base,
+    2: brazo.hombro,
+    3: brazo.codo,
+    4: brazo.muñeca,
+}
+
+serial = Serial() if PERMITIR_CONTROL_MANUAL else None
+
+print("Esperando ordenes de la central por ESP-NOW...")
+if PERMITIR_CONTROL_MANUAL:
+    print("(tambien acepta comandos manuales S1:90, S2:45, etc, por USB)")
+
+while True:
+    revisar_espnow(brazo)
+    if PERMITIR_CONTROL_MANUAL:
+        revisar_manual(serial)
+    time.sleep_ms(20)
