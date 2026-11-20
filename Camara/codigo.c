@@ -1,10 +1,11 @@
 
-// ESP32-CAM: mide el color del centro de la imagen.
+// ESP32-CAM: clasifica el color del contenedor (gris, naranja, beige) y detecta si hay un contenedor.
 // Conexiones:
 //   Camara OV3660 integrada en la placa AI Thinker ESP32-CAM
 //   Alimentacion y programacion por USB-serie (115200)
 //==========================================================
 
+#include <math.h>
 #include "esp_camera.h"
 #include <string.h>
 #include <stdint.h>
@@ -27,10 +28,25 @@
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
+// Iguales a los valores PIEZA_* de la central y del brazo
+#define PIEZA_DESCONOCIDA 0
+#define PIEZA_TORNILLO    1
+#define PIEZA_TUERCA      2
+#define PIEZA_ARANDELA    3
+
 // Exposicion y ganancia fijas: tienen que ser las mismas que en el sketch de calibracion
 #define EXPOSICION_FIJA     1
 #define EXPOSICION_VALOR  600
 #define GANANCIA_VALOR      5
+
+// Fondo vacio medido en la calibracion (1 = usarlo, 0 = medirlo al prender la camara)
+#define USAR_FONDO_FIJO            1
+#define FONDO_R                   36
+#define FONDO_G                   67
+#define FONDO_B                   39
+
+// Diferencia minima respecto del fondo vacio para decir que hay un contenedor
+#define UMBRAL_PRESENCIA          60
 
 static bool iniciarCamara(void) {
   camera_config_t config;
@@ -112,6 +128,51 @@ static void colorPromedioCentral(camera_fb_t *fb, float *rProm, float *gProm, fl
   *bProm = (float)sumaB / cuenta;
 }
 
+// Colores de referencia medidos. Un color solo se acepta si esta cerca de una
+// referencia: las mezclas de cuando el contenedor entra o sale se ignoran (DESCONOCIDO).
+#define REF_GRIS_R   119
+#define REF_GRIS_G   202
+#define REF_GRIS_B   151
+#define REF_NARANJA_R 154
+#define REF_NARANJA_G 127
+#define REF_NARANJA_B  57
+#define REF_BEIGE_R   20
+#define REF_BEIGE_G   32
+#define REF_BEIGE_B    0
+#define DIST_MAX_GRIS     50
+#define DIST_MAX_NARANJA  60
+#define DIST_MAX_BEIGE    40
+
+static float distanciaColor(float r, float g, float b, float rr, float gg, float bb) {
+  float dr = r - rr, dg = g - gg, db = b - bb;
+  return sqrtf(dr * dr + dg * dg + db * db);
+}
+
+static uint8_t clasificarColor(float r, float g, float b) {
+
+  // el gris refleja la luz y satura la imagen: ningun otro contenedor llega a eso
+  if (r > 150 && g > 235 && b > 200) return PIEZA_TORNILLO;
+  float dGris    = distanciaColor(r, g, b, REF_GRIS_R, REF_GRIS_G, REF_GRIS_B);
+  float dNaranja = distanciaColor(r, g, b, REF_NARANJA_R, REF_NARANJA_G, REF_NARANJA_B);
+  float dBeige   = distanciaColor(r, g, b, REF_BEIGE_R, REF_BEIGE_G, REF_BEIGE_B);
+
+  uint8_t mejor = PIEZA_DESCONOCIDA;
+  float dMejor = 1e9f;
+  if (dGris < DIST_MAX_GRIS && dGris < dMejor)          { mejor = PIEZA_TORNILLO; dMejor = dGris; }
+  if (dNaranja < DIST_MAX_NARANJA && dNaranja < dMejor) { mejor = PIEZA_TUERCA;   dMejor = dNaranja; }
+  if (dBeige < DIST_MAX_BEIGE && dBeige < dMejor)       { mejor = PIEZA_ARANDELA; dMejor = dBeige; }
+  return mejor;
+}
+
+static const char *nombrePieza(uint8_t tipo) {
+  switch (tipo) {
+    case PIEZA_TORNILLO: return "TORNILLO (gris)";
+    case PIEZA_TUERCA:   return "TUERCA (naranja)";
+    case PIEZA_ARANDELA: return "ARANDELA (beige)";
+    default:             return "DESCONOCIDO (mezcla / en transito, se ignora)";
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   Serial.println();
@@ -119,6 +180,7 @@ void setup() {
     Serial.println("[CAM] Sin camara, revisar la conexion y reiniciar");
     while (true) delay(1000);
   }
+  delay(2000);   // calentamiento: los primeros cuadros salen inestables
 }
 
 void loop() {
@@ -130,7 +192,12 @@ void loop() {
   }
   float r, g, b;
   colorPromedioCentral(fb, &r, &g, &b);
+  uint8_t tipo = clasificarColor(r, g, b);
   esp_camera_fb_return(fb);
-  Serial.printf("R=%.0f G=%.0f B=%.0f\n", r, g, b);
+
+  float dif = fabsf(r - FONDO_R) + fabsf(g - FONDO_G) + fabsf(b - FONDO_B);
+  bool hayContenedor = (dif > UMBRAL_PRESENCIA);
+  Serial.printf("R=%.0f G=%.0f B=%.0f  dif=%.0f  -> %s\n", r, g, b, dif,
+                hayContenedor ? nombrePieza(tipo) : "(vacio, no hay contenedor)");
   delay(150);
 }
