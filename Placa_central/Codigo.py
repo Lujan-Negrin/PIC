@@ -3,17 +3,21 @@
 #   GPIO33 boton ACK (a GND)
 #   GPIO25 LED verde, GPIO26 LED amarillo, GPIO27 LED rojo
 #   GPIO18 servo de la barrera
+#   GPIO14 buzzer (1 a 4 pitidos segun el error)
 #   GPIO13 salida de control de la cinta (sin uso en la version final)
 #==========================================================
 
 from machine import Pin, PWM
 import network
 import espnow
+import sys
+import select
 import time
 
 # PINES 
 PIN_LED_VERDE, PIN_LED_AMARILLO, PIN_LED_ROJO = 25, 26, 27
 PIN_CINTA_STOP = 13
+PIN_BUZZER = 14
 PIN_SENSOR_SALIDA = 32
 PIN_BOTON_ACK = 33
 PIN_BARRERA = 18
@@ -24,6 +28,10 @@ led_rojo = Pin(PIN_LED_ROJO, Pin.OUT)
 led_cinta_stop = Pin(PIN_CINTA_STOP, Pin.OUT)
 pin_sensor = Pin(PIN_SENSOR_SALIDA, Pin.IN, Pin.PULL_UP)
 pin_ack = Pin(PIN_BOTON_ACK, Pin.IN, Pin.PULL_UP)
+
+buzzer_pwm = PWM(Pin(PIN_BUZZER, Pin.OUT))
+buzzer_pwm.freq(2000)
+buzzer_pwm.duty_u16(0)
 
 barrera_pwm = PWM(Pin(PIN_BARRERA, Pin.OUT))
 barrera_pwm.freq(50)
@@ -66,7 +74,7 @@ NOMBRE_ESTADO = {
     EST_LIBERAR_CONTENEDOR: "LIBERAR_CONTENEDOR", EST_ERROR: "ERROR",
 }
 
-# Codigo de cada causa de error
+# Cada causa de error vale su cantidad de pitidos
 ERR_NINGUNO, ERR_COLOR_TIMEOUT, ERR_COLOR_DESCONOCIDO, ERR_BRAZO_TIMEOUT, ERR_BRAZO_FALLA = 0, 1, 2, 3, 4
 
 NOMBRE_CAUSA = {
@@ -81,6 +89,7 @@ causa = ERR_NINGUNO
 t_estado = time.ticks_ms()
 id_secuencia = 0
 tipo_actual = PIEZA_DESCONOCIDA
+buzzer_sonando = False
 
 hay_color = False
 color_tipo = PIEZA_DESCONOCIDA
@@ -123,6 +132,28 @@ boton_ack = Entrada(pin_ack)
 
 def detener_cinta(detener):
     led_cinta_stop.value(1 if detener else 0)
+
+
+def buzzer_encender():
+    buzzer_pwm.duty_u16(32768)
+
+
+def buzzer_apagar():
+    buzzer_pwm.duty_u16(0)
+
+
+def actualizar_buzzer():
+    # N pitidos cortos (N = causa del error) y una pausa, en bucle
+    global buzzer_sonando
+    debe_sonar = False
+    if estado == EST_ERROR and causa != ERR_NINGUNO:
+        duracion = causa * 300
+        ciclo = duracion + 1200
+        t = time.ticks_diff(time.ticks_ms(), t_estado) % ciclo
+        debe_sonar = (t < duracion) and ((t % 300) < 150)
+    if debe_sonar != buzzer_sonando:
+        buzzer_sonando = debe_sonar
+        buzzer_encender() if debe_sonar else buzzer_apagar()
 
 
 # BARRERA 
@@ -230,7 +261,7 @@ def ir_a_error(c):
     detener_cinta(True)
     enviar_orden_brazo(CMD_PAUSA, 0)
     cambiar_estado(EST_ERROR)
-    print("[ERROR] {} (codigo {}). Apretar ACK.".format(NOMBRE_CAUSA.get(c, "?"), c))
+    print("[ERROR] {} ({} pitidos). Apretar ACK.".format(NOMBRE_CAUSA.get(c, "?"), c))
 
 
 def liberar_contenedor():
@@ -292,20 +323,72 @@ def actualizar_estado():
             liberar_contenedor()
 
 
+# COMANDOS POR USB (pruebas sin camara ni sensor) 
+# TORNILLO / TUERCA / ARANDELA / DESCONOCIDO: simula el color de la camara
+# SENSOR: simula que el contenedor llego al sensor de salida
+# B:<angulo>, ABRIR, CERRAR: mueven la barrera
+def procesar_comando(cmd):
+    global sensor_simulado
+    cmd = cmd.strip().upper()
+    if cmd == "":
+        return
+    if cmd in ("TORNILLO", "TUERCA", "ARANDELA", "DESCONOCIDO"):
+        guardar_color(tipo_desde_texto(cmd), "manual")
+    elif cmd == "SENSOR":
+        sensor_simulado = True
+        print("[MANUAL] sensor de salida simulado")
+    elif cmd == "ABRIR":
+        abrir_barrera()
+    elif cmd == "CERRAR":
+        cerrar_barrera()
+    elif cmd.startswith("B:"):
+        try:
+            mover_barrera(float(cmd[2:]))
+            print("[MANUAL] barrera en", cmd[2:])
+        except ValueError:
+            print("[MANUAL] formato: B:90")
+    else:
+        print("[MANUAL] comando desconocido:", cmd)
+
+
+class LectorSerial:
+    def __init__(self):
+        self.spoll = select.poll()
+        self.spoll.register(sys.stdin, select.POLLIN)
+        self.buffer = ""
+
+    def procesar(self):
+        while self.spoll.poll(0):
+            c = sys.stdin.read(1)
+            if c in ("\n", "\r"):
+                if self.buffer:
+                    print()
+                    procesar_comando(self.buffer)
+                    self.buffer = ""
+            else:
+                sys.stdout.write(c)
+                self.buffer += c
+
+
 # ARRANQUE 
+buzzer_apagar()
 detener_cinta(False)
 abrir_barrera()
 
 print("=== ESP32 CENTRAL (COLOR) ===")
 print("Mi MAC:", wifi.config('mac'))
 print("Esperando el sensor de salida y los colores de la camara...")
+print("(a mano por USB: TORNILLO / TUERCA / ARANDELA / DESCONOCIDO, SENSOR, B:90, ABRIR, CERRAR)")
 
+lector = LectorSerial()
 cambiar_estado(EST_LIBRE)
 
 while True:
     sensor.actualizar()
     boton_ack.actualizar()
+    lector.procesar()
     revisar_espnow()
     actualizar_estado()
     actualizar_barrera()
+    actualizar_buzzer()
     time.sleep_ms(10)
