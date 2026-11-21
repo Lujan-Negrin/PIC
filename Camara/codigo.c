@@ -1,14 +1,23 @@
-
-// ESP32-CAM: clasifica el color del contenedor (gris, naranja, beige) y detecta si hay un contenedor.
 // Conexiones:
 //   Camara OV3660 integrada en la placa AI Thinker ESP32-CAM
-//   Alimentacion y programacion por USB-serie (115200)
+//   GPIO13 sensor de entrada (opcional, sin uso en la version final)
+//   La luz blanca esta conectada a la central, no a esta placa
 //==========================================================
 
+// ESP32-CAM: detecta el color del contenedor (gris = tornillo, naranja = tuerca,
+// beige = arandela) y se lo manda a la central por ESP-NOW.
+// Placa: AI Thinker ESP32-CAM. Para cargar el codigo: GPIO0 a GND (o boton IO0) mientras dice "Connecting...".
+// La camara queda siempre prendida (TIEMPO_CAMARA_ENCENDIDA_MS = 0). Con un sensor de entrada
+// en GPIO13 podria apagarse sola despues de un tiempo sin actividad.
 #include <math.h>
 #include "esp_camera.h"
+#include <esp_now.h>
+#include <WiFi.h>
+#include <esp_mac.h>
 #include <string.h>
+#include <stdbool.h>
 #include <stdint.h>
+#include <math.h>
 
 // Pines de la camara (AI Thinker)
 #define PWDN_GPIO_NUM     32
@@ -28,16 +37,32 @@
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
+// Sensor de entrada (opcional, solo se usa si TIEMPO_CAMARA_ENCENDIDA_MS > 0)
+#define PIN_SENSOR_ENTRADA 13
+
+// MAC de la central
+static uint8_t macCentral[6] = {0x7C, 0xD5, 0x44, 0x24, 0x55, 0x08};
+
 // Iguales a los valores PIEZA_* de la central y del brazo
 #define PIEZA_DESCONOCIDA 0
 #define PIEZA_TORNILLO    1
 #define PIEZA_TUERCA      2
 #define PIEZA_ARANDELA    3
 
-// Exposicion y ganancia fijas: tienen que ser las mismas que en el sketch de calibracion
-#define EXPOSICION_FIJA     1
-#define EXPOSICION_VALOR  600
-#define GANANCIA_VALOR      5
+// Umbrales de color
+#define UMBRAL_G_OSCURO            35
+#define UMBRAL_B_CONTENEDOR_NUEVO  15
+#define UMBRAL_AMARILLEZ_NARANJA   50
+#define LECTURAS_PARA_CONFIRMAR     3
+#define TIEMPO_ENTRE_ENVIOS      1500
+
+// Tiempo que queda prendida la camara sin actividad (0 = nunca se apaga)
+#define TIEMPO_CAMARA_ENCENDIDA_MS  0
+
+// Deteccion de contenedor: calentamiento de la camara y fondo vacio de referencia
+#define TIEMPO_CALENTAMIENTO_MS   2000
+
+#define FRAMES_BASELINE            4
 
 // Fondo vacio medido en la calibracion (1 = usarlo, 0 = medirlo al prender la camara)
 #define USAR_FONDO_FIJO            1
@@ -45,8 +70,58 @@
 #define FONDO_G                   67
 #define FONDO_B                   39
 
+// 1 = la camara arranca prendida
+#define ARRANCA_PRENDIDA           1
+
 // Diferencia minima respecto del fondo vacio para decir que hay un contenedor
 #define UMBRAL_PRESENCIA          60
+
+#define TIEMPO_DEBOUNCE_SENSOR_MS 30
+
+// Exposicion y ganancia fijas: tienen que ser las mismas que en el sketch de calibracion
+#define EXPOSICION_FIJA     1
+#define EXPOSICION_VALOR  600
+#define GANANCIA_VALOR      5
+
+// Estado global
+static uint8_t ultimaDeteccion = PIEZA_DESCONOCIDA;
+static uint8_t repeticiones = 0;
+static unsigned long ultimoEnvio = 0;
+
+static bool camaraEncendida = false;
+static unsigned long ultimaActividad = 0;
+
+static unsigned long tArranque = 0;
+static uint8_t framesBaseline = 0;
+static float baseR = 0, baseG = 0, baseB = 0;
+
+static bool sensorActivo = false;
+static bool sensorLecturaPrev = false;
+static unsigned long sensorTCambio = 0;
+
+static const char *nombrePieza(uint8_t tipo) {
+  switch (tipo) {
+    case PIEZA_TORNILLO: return "TORNILLO (gris)";
+    case PIEZA_TUERCA:   return "TUERCA (naranja)";
+    case PIEZA_ARANDELA: return "ARANDELA (beige)";
+    default:             return "DESCONOCIDO (mezcla / en transito, se ignora)";
+  }
+}
+
+static bool sensorEntradaFlancoActivacion(void) {
+  bool lectura = (digitalRead(PIN_SENSOR_ENTRADA) == LOW);
+  if (lectura != sensorLecturaPrev) {
+    sensorTCambio = millis();
+    sensorLecturaPrev = lectura;
+  }
+  if ((millis() - sensorTCambio) > TIEMPO_DEBOUNCE_SENSOR_MS && lectura != sensorActivo) {
+    sensorActivo = lectura;
+    if (sensorActivo) {
+      return true;
+    }
+  }
+  return false;
+}
 
 static bool iniciarCamara(void) {
   camera_config_t config;
@@ -94,6 +169,40 @@ static bool iniciarCamara(void) {
   }
 #endif
   return true;
+}
+
+static void prenderCamara(void) {
+  if (camaraEncendida) {
+    return;
+  }
+  if (iniciarCamara()) {
+    camaraEncendida = true;
+    ultimaDeteccion = PIEZA_DESCONOCIDA;
+    repeticiones = 0;
+    tArranque = millis();
+#if USAR_FONDO_FIJO
+    framesBaseline = FRAMES_BASELINE;
+    baseR = FONDO_R; baseG = FONDO_G; baseB = FONDO_B;
+#else
+    framesBaseline = 0;
+    baseR = 0; baseG = 0; baseB = 0;
+#endif
+    Serial.println("[CAM] Camara ENCENDIDA (detecto el sensor de entrada)");
+  } else {
+    Serial.println("[CAM] No se pudo encender la camara");
+  }
+}
+
+static void apagarCamara(void) {
+  if (!camaraEncendida) {
+    return;
+  }
+  esp_camera_deinit();
+
+  pinMode(PWDN_GPIO_NUM, OUTPUT);
+  digitalWrite(PWDN_GPIO_NUM, HIGH);
+  camaraEncendida = false;
+  Serial.println("[CAM] Camara APAGADA (sin actividad, ahorrando y enfriando)");
 }
 
 // Promedio del color de un cuadrado de 40x40 en el centro de la imagen
@@ -164,40 +273,174 @@ static uint8_t clasificarColor(float r, float g, float b) {
   return mejor;
 }
 
-static const char *nombrePieza(uint8_t tipo) {
-  switch (tipo) {
-    case PIEZA_TORNILLO: return "TORNILLO (gris)";
-    case PIEZA_TUERCA:   return "TUERCA (naranja)";
-    case PIEZA_ARANDELA: return "ARANDELA (beige)";
-    default:             return "DESCONOCIDO (mezcla / en transito, se ignora)";
+// Votacion por cada paso de contenedor.
+#define VOTOS_PARA_CONFIRMAR  3
+#define VOTOS_AL_SALIR        2
+#define VOTOS_BEIGE_MIN       3
+#define VOTOS_BEIGE_SI_HAY_OTRO 6
+#define MUESTREO_MS          30
+
+static uint8_t votos[4] = {0, 0, 0, 0};
+static bool enviadoEnEstePaso = false;
+static uint8_t vaciosSeguidos = 0;
+static uint8_t desconocidos = 0;
+#define DESCONOCIDOS_MIN      4
+#define DESCONOCIDOS_VS_VOTOS 3
+#define VACIOS_PARA_CERRAR    4
+static uint8_t ultimoTipoEnviado = PIEZA_DESCONOCIDA;
+
+static void enviarColor(uint8_t tipo) {
+
+  if (tipo == ultimoTipoEnviado && (millis() - ultimoEnvio) <= TIEMPO_ENTRE_ENVIOS) return;
+  uint8_t msg[1];
+  msg[0] = tipo;
+  esp_now_send(macCentral, msg, 1);
+  Serial.print("[CAM] Color confirmado y enviado: ");
+  Serial.println(nombrePieza(tipo));
+  ultimoEnvio = millis();
+  ultimoTipoEnviado = tipo;
+  ultimaActividad = millis();
+  enviadoEnEstePaso = true;
+}
+
+static void onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
+  (void)info;
+  if (status == ESP_NOW_SEND_SUCCESS) {
+    Serial.println("[CAM] Enviado OK");
+  } else {
+    Serial.println("[CAM] Error al enviar");
   }
 }
 
 void setup() {
   Serial.begin(115200);
   Serial.println();
-  if (!iniciarCamara()) {
-    Serial.println("[CAM] Sin camara, revisar la conexion y reiniciar");
-    while (true) delay(1000);
+
+  pinMode(PIN_SENSOR_ENTRADA, INPUT_PULLUP);
+
+  WiFi.mode(WIFI_STA);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error iniciando ESP-NOW");
+    return;
   }
-  delay(2000);   // calentamiento: los primeros cuadros salen inestables
+  esp_now_register_send_cb(onDataSent);
+
+  uint8_t mac[6];
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  Serial.printf("Mi MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  Serial.println("(copiar esta MAC en MAC_CAM del codigo de la central)");
+
+  esp_now_peer_info_t peerInfo;
+  memset(&peerInfo, 0, sizeof(peerInfo));
+  memcpy(peerInfo.peer_addr, macCentral, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Error agregando a la central como peer");
+  }
+
+  pinMode(PWDN_GPIO_NUM, OUTPUT);
+  digitalWrite(PWDN_GPIO_NUM, HIGH);
+  camaraEncendida = false;
+  ultimaActividad = millis();
+#if ARRANCA_PRENDIDA
+  prenderCamara();
+  Serial.println("Camara prendida al arrancar; el sensor de entrada la vuelve a prender si se apaga por inactividad.");
+#else
+  Serial.println("Camara apagada; el sensor de entrada la prende cuando pasa un contenedor.");
+#endif
 }
 
 void loop() {
+
+  if (sensorEntradaFlancoActivacion()) {
+    Serial.println("[SENSOR ENTRADA] activado");
+    ultimaActividad = millis();
+    prenderCamara();
+  }
+
+  if (!camaraEncendida) {
+    delay(20);
+    return;
+  }
+
   camera_fb_t *fb = esp_camera_fb_get();
   if (fb == NULL) {
     Serial.println("[CAM] Error capturando frame");
     delay(200);
-    return;
-  }
-  float r, g, b;
-  colorPromedioCentral(fb, &r, &g, &b);
-  uint8_t tipo = clasificarColor(r, g, b);
-  esp_camera_fb_return(fb);
+  } else {
+    float r, g, b;
+    colorPromedioCentral(fb, &r, &g, &b);
+    uint8_t tipo = clasificarColor(r, g, b);
 
-  float dif = fabsf(r - FONDO_R) + fabsf(g - FONDO_G) + fabsf(b - FONDO_B);
-  bool hayContenedor = (dif > UMBRAL_PRESENCIA);
-  Serial.printf("R=%.0f G=%.0f B=%.0f  dif=%.0f  -> %s\n", r, g, b, dif,
-                hayContenedor ? nombrePieza(tipo) : "(vacio, no hay contenedor)");
-  delay(150);
+    esp_camera_fb_return(fb);
+
+    // Hay contenedor adelante o solo fondo vacio
+    bool hayContenedor = false;
+    bool calentando = ((millis() - tArranque) < TIEMPO_CALENTAMIENTO_MS);
+    if (calentando) {
+      Serial.printf("[CAM] calentando t=%lu ms  R=%.0f G=%.0f B=%.0f\n", millis() - tArranque, r, g, b);
+    } else if (framesBaseline < FRAMES_BASELINE) {
+      baseR += r; baseG += g; baseB += b;
+      framesBaseline++;
+      if (framesBaseline == FRAMES_BASELINE) {
+        baseR /= FRAMES_BASELINE; baseG /= FRAMES_BASELINE; baseB /= FRAMES_BASELINE;
+        Serial.printf("[CAM] fondo vacio guardado: R=%.0f G=%.0f B=%.0f. Listo para detectar.\n", baseR, baseG, baseB);
+      }
+    } else {
+      float dif = fabsf(r - baseR) + fabsf(g - baseG) + fabsf(b - baseB);
+      hayContenedor = (dif > UMBRAL_PRESENCIA);
+      Serial.printf("R=%.0f G=%.0f B=%.0f  dif=%.0f  -> %s\n", r, g, b, dif,
+                    hayContenedor ? nombrePieza(tipo) : "(vacio, no hay contenedor)");
+    }
+
+    // Votacion: se cuentan los votos de cada color mientras el contenedor esta adelante;
+    // se manda el color al juntar suficientes votos o cuando el contenedor se va
+    if (!hayContenedor) {
+
+      if (vaciosSeguidos < 255) vaciosSeguidos++;
+      if (vaciosSeguidos < VACIOS_PARA_CERRAR) {
+
+      } else {
+      if (!enviadoEnEstePaso && (votos[1] + votos[2] + votos[3]) > 0) {
+        Serial.printf("[CAM] votos: gris=%d naranja=%d beige=%d\n", votos[1], votos[2], votos[3]);
+        uint8_t claro = (votos[1] >= votos[2]) ? PIEZA_TORNILLO : PIEZA_TUERCA;
+        uint8_t vClaro = votos[claro];
+        if (votos[3] >= VOTOS_BEIGE_MIN && votos[3] >= 2 * vClaro) {
+          enviarColor(PIEZA_ARANDELA);
+        } else if (vClaro >= VOTOS_AL_SALIR) {
+          enviarColor(claro);
+        } else if (votos[3] >= (vClaro > 0 ? VOTOS_BEIGE_SI_HAY_OTRO : VOTOS_BEIGE_MIN)) {
+          enviarColor(PIEZA_ARANDELA);
+        }
+      }
+
+      // Contenedor de otro color: se avisa a la central como DESCONOCIDO
+      if (!enviadoEnEstePaso && desconocidos >= DESCONOCIDOS_MIN &&
+          desconocidos >= DESCONOCIDOS_VS_VOTOS * (votos[1] + votos[2] + votos[3])) {
+        Serial.printf("[CAM] color desconocido: %d lecturas raras, %d votos validos\n", desconocidos, votos[1] + votos[2] + votos[3]);
+        enviarColor(PIEZA_DESCONOCIDA);
+      }
+      votos[1] = votos[2] = votos[3] = 0;
+      desconocidos = 0;
+      enviadoEnEstePaso = false;
+      }
+    } else {
+      vaciosSeguidos = 0;
+    }
+    if (hayContenedor && tipo == PIEZA_DESCONOCIDA && desconocidos < 255) desconocidos++;
+    if (hayContenedor && tipo != PIEZA_DESCONOCIDA) {
+      votos[tipo]++;
+
+      if (tipo != PIEZA_ARANDELA && !enviadoEnEstePaso && votos[tipo] >= VOTOS_PARA_CONFIRMAR) enviarColor(tipo);
+    }
+
+    delay(calentando ? 20 : MUESTREO_MS);
+  }
+
+  if (TIEMPO_CAMARA_ENCENDIDA_MS > 0 && (millis() - ultimaActividad) > TIEMPO_CAMARA_ENCENDIDA_MS) {
+    apagarCamara();
+  }
 }
