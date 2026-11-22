@@ -7,6 +7,7 @@ from machine import Pin, PWM
 import time
 import sys
 import select
+import math
 
 # Pines de los servos
 PIN_BASE = 12
@@ -17,7 +18,7 @@ PIN_MUÑECA = 27
 # LED: el brazo esta en movimiento
 PIN_LED_TRABAJANDO = 2
 
-# Comandos manuales por USB: S1/S2/S3/S4:<angulo>, REPOSO
+# Comandos manuales por USB: S1/S2/S3/S4:<angulo>, P:x,y,z, REPOSO
 PERMITIR_CONTROL_MANUAL = True
 
 # Limites de seguridad de los servos (grados)
@@ -81,6 +82,54 @@ class Brazo:
         self.muñeca.off()
 
 
+# Cinematica inversa
+
+
+class CI:
+    def __init__(self, l1, l2, l3, l4):
+        self.l1, self.l2, self.l3, self.l4 = l1, l2, l3, l4
+
+    def calcular(self, punto):
+        x, y, z = punto[0], punto[1], punto[2] - self.l1 + self.l4
+
+        r = math.sqrt(x**2 + y**2)
+        R = math.sqrt(z**2 + r**2)
+        c = (R**2 - self.l3**2 - self.l2**2) / (2 * self.l2 * self.l3)
+
+        if abs(c) > 1:
+            return None
+
+        tita1 = math.atan2(y, x)
+        tita2 = math.atan2(z, r) + math.atan2(self.l3 * math.sqrt(1 - c**2), (self.l2 + self.l3 * c))
+        tita3 = math.atan2(math.sqrt(1 - c**2), c)
+
+        tita1_deg = math.degrees(tita1)
+        tita2_deg = math.degrees(tita2)
+        tita3_deg = math.degrees(tita3)
+
+        # la muñeca compensa la inclinacion del antebrazo para que el electroiman mire hacia abajo
+        tita4_deg = 90 - (tita2_deg - tita3_deg)
+
+        return [tita1_deg, tita2_deg, tita3_deg, tita4_deg]
+
+LARGOS = (11, 13.5, 8, 9)
+ci = CI(*LARGOS)
+
+# Conversion: angulo_servo = angulo_ci * signo + offset
+SIGNO_ANGULO = [1, 1, 1, 1]
+OFFSET_ANGULO = [90, 0, 0, 0]
+
+
+def angulos_validos(angulos_crudos):
+    angulos = []
+    for i in range(4):
+        valor = angulos_crudos[i] * SIGNO_ANGULO[i] + OFFSET_ANGULO[i]
+        if valor < 0 or valor > 180:
+            print("[BRAZO] Aviso: angulo fuera de rango en servo {}: {:.1f}, se recorta".format(i + 1, valor))
+        angulos.append(max(0, min(180, valor)))
+    return angulos
+
+
 # Posiciones en cm desde el eje de la base: x hacia adelante, y hacia la izquierda
 POSICION_REPOSO = [90, 90, 90, 90]
 
@@ -106,6 +155,22 @@ class Serial:
 SERVO_POR_INDICE = None
 
 
+def ir_a_punto(texto):
+    try:
+        x, y, z = [float(v) for v in texto.split(":", 1)[1].split(",")]
+    except (ValueError, IndexError):
+        print("[MANUAL] Formato invalido, usar P:x,y,z  (ej. P:10,0,8)")
+        return
+    crudos = ci.calcular((x, y, z))
+    if crudos is None:
+        print("[MANUAL] Punto fuera de alcance del brazo:", (x, y, z))
+        return
+    print("[MANUAL] CI (base, hombro, codo, muñeca):", [round(v, 1) for v in crudos])
+    angulos = angulos_validos(crudos)
+    print("[MANUAL] Angulos a los servos:", [round(v, 1) for v in angulos])
+    brazo.mover_suave(angulos)
+
+
 def revisar_manual(serial):
     if not serial.verificar():
         return
@@ -113,6 +178,9 @@ def revisar_manual(serial):
     if lectura.upper() == "REPOSO":
         brazo.mover_suave(POSICION_REPOSO)
         print("[MANUAL] Brazo en reposo")
+        return
+    if lectura.upper().startswith("P:"):
+        ir_a_punto(lectura)
         return
 
     if lectura.startswith("S") and ":" in lectura:
@@ -149,7 +217,7 @@ SERVO_POR_INDICE = {
 serial = Serial() if PERMITIR_CONTROL_MANUAL else None
 
 if PERMITIR_CONTROL_MANUAL:
-    print("(comandos manuales por USB: S1:90, S2:45, REPOSO)")
+    print("(comandos manuales por USB: S1:90, S2:45, P:10,0,8, REPOSO)")
 
 while True:
     if PERMITIR_CONTROL_MANUAL:
