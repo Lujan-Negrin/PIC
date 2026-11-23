@@ -5,6 +5,8 @@
 #==========================================================
 
 from machine import Pin, PWM
+import network
+import espnow
 import time
 import sys
 import select
@@ -24,10 +26,16 @@ PIN_IMAN = 15
 IMAN_ACTIVO_ALTO = True
 TIEMPO_MAX_IMAN_MS = 60000
 
+# Comunicacion con la central (ESP-NOW)
+MAC_CENTRAL = b'\x7C\xD5\x44\x24\x55\x08'
+
 PIEZA_DESCONOCIDA = 0
 PIEZA_TORNILLO = 1
 PIEZA_TUERCA = 2
 PIEZA_ARANDELA = 3
+
+CMD_EJECUTAR = 1
+CMD_PAUSA = 2
 
 BRAZO_OK = 1
 BRAZO_OCUPADO = 2
@@ -262,6 +270,43 @@ def mover_pieza(brazo, tipo):
     return BRAZO_ERROR
 
 
+# ESP-NOW
+wifi = network.WLAN(network.STA_IF)
+wifi.active(True)
+enlace = espnow.ESPNow()
+enlace.active(True)
+enlace.add_peer(MAC_CENTRAL)
+
+
+def enviar_respuesta(estado, id_secuencia):
+    msg = bytes([estado, (id_secuencia >> 8) & 0xFF, id_secuencia & 0xFF])
+    try:
+        entregado = enlace.send(MAC_CENTRAL, msg)
+        if entregado:
+            print("[BRAZO] Respuesta enviada a la central (estado={}, id={})".format(estado, id_secuencia))
+        else:
+            print("[BRAZO] La central NO recibio la respuesta: revisar que MAC_CENTRAL sea la real")
+    except OSError as e:
+        print("Error enviando respuesta a la central:", e)
+
+
+def revisar_espnow(brazo):
+    host, msg = enlace.recv(0)
+    if msg is None or len(msg) != 4:
+        return
+    comando, tipo = msg[0], msg[1]
+    id_secuencia = (msg[2] << 8) | msg[3]
+
+    if comando == CMD_EJECUTAR:
+        print("[BRAZO] Orden recibida: EJECUTAR, id={}".format(id_secuencia))
+        estado = mover_pieza(brazo, tipo)
+        enviar_respuesta(estado, id_secuencia)
+    elif comando == CMD_PAUSA:
+        print("[BRAZO] Orden recibida: PAUSA, id={}".format(id_secuencia))
+        led_trabajando.value(0)
+        iman(False)
+
+
 # Control manual por USB
 
 class Serial:
@@ -364,6 +409,8 @@ if PIN_IMAN is not None:
     iman(False)
 
 print("ESP32 BRAZO")
+print("Mi MAC:", wifi.config('mac'))
+print("(copiar esta MAC en MAC_BRAZO del codigo de la central)")
 
 brazo = Brazo()
 brazo.set_angulos(POSICION_REPOSO)
@@ -377,11 +424,13 @@ SERVO_POR_INDICE = {
 
 serial = Serial() if PERMITIR_CONTROL_MANUAL else None
 
+print("Esperando ordenes de la central por ESP-NOW...")
 if PERMITIR_CONTROL_MANUAL:
     print("(tambien acepta comandos manuales S1:90, S2:45, P:10,0,8, REPOSO, IMAN:1, IMAN:0, por USB)")
 
 while True:
     revisar_timeout_iman()
+    revisar_espnow(brazo)
     if PERMITIR_CONTROL_MANUAL:
         revisar_manual(serial)
     time.sleep_ms(20)
