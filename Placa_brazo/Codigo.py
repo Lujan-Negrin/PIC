@@ -2,7 +2,6 @@
 #   GPIO12 servo base, GPIO25 servo hombro, GPIO32 servo codo, GPIO27 servo muñeca
 #   GPIO2 LED que indica que el brazo se esta moviendo
 #   GPIO15 electroiman (a traves de un MOSFET)
-#==========================================================
 
 from machine import Pin, PWM
 import network

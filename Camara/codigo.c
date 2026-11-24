@@ -1,14 +1,8 @@
 // Conexiones:
-//   Camara OV3660 integrada en la placa AI Thinker ESP32-CAM
-//   GPIO13 sensor de entrada (opcional, sin uso en la version final)
-//   La luz blanca esta conectada a la central, no a esta placa
-//==========================================================
-
 // ESP32-CAM: detecta el color del contenedor (gris = tornillo, naranja = tuerca,
 // beige = arandela) y se lo manda a la central por ESP-NOW.
-// Placa: AI Thinker ESP32-CAM. Para cargar el codigo: GPIO0 a GND (o boton IO0) mientras dice "Connecting...".
-// La camara queda siempre prendida (TIEMPO_CAMARA_ENCENDIDA_MS = 0). Con un sensor de entrada
-// en GPIO13 podria apagarse sola despues de un tiempo sin actividad.
+// Placa: AI Thinker ESP32-CAM. .
+// La camara queda siempre prendida (TIEMPO_CAMARA_ENCENDIDA_MS = 0). 
 #include <math.h>
 #include "esp_camera.h"
 #include <esp_now.h>

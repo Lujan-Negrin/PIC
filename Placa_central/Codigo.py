@@ -1,11 +1,9 @@
 # Conexiones:
 #   GPIO32 sensor IR de salida de la cinta
-#   GPIO33 boton ACK (a GND)
+#   GPIO33 boton ACK
 #   GPIO25 LED verde, GPIO26 LED amarillo, GPIO27 LED rojo
 #   GPIO18 servo de la barrera
 #   GPIO14 buzzer (1 a 4 pitidos segun el error)
-#   GPIO13 salida de control de la cinta (sin uso en la version final)
-#==========================================================
 
 from machine import Pin, PWM
 import network
